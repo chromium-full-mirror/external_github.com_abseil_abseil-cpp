@@ -137,6 +137,17 @@ TEST_F(FlagTest, Traits) {
             flags::FlagValueStorageKind::kSequenceLocked);
   EXPECT_EQ(flags::StorageKind<absl::uint128>(),
             flags::FlagValueStorageKind::kSequenceLocked);
+
+  // These sizes are not hard limits, but we want to keep per-flag size as
+  // small as possible because production binaries may define thousands of
+  // flags.
+  if (sizeof(void*) == 8) {
+    EXPECT_EQ(sizeof(flags::FlagImpl), 56);
+    EXPECT_EQ(sizeof(absl::Flag<bool>), 64);
+    EXPECT_EQ(sizeof(absl::Flag<int>), 64);
+    EXPECT_EQ(sizeof(absl::Flag<int64_t>), 64);
+    EXPECT_EQ(sizeof(absl::Flag<double>), 64);
+  }
 }
 
 // --------------------------------------------------------------------
@@ -148,17 +159,16 @@ using String = std::string;
 using int128 = absl::int128;
 using uint128 = absl::uint128;
 
-#define DEFINE_CONSTRUCTED_FLAG(T, dflt, dflt_kind)                        \
-  constexpr flags::FlagDefaultArg f1default##T{                            \
-      flags::FlagDefaultSrc{dflt}, flags::FlagDefaultKind::dflt_kind};     \
-  constexpr absl::Flag<T> f1##T{"f1", #T, "file", help_arg, f1default##T}; \
-  ABSL_CONST_INIT absl::Flag<T> f2##T {                                    \
-    "f2", #T, "file",                                                      \
-        {flags::FlagHelpMsg(&TestHelpMsg), flags::FlagHelpKind::kGenFunc}, \
-        flags::FlagDefaultArg {                                            \
-      flags::FlagDefaultSrc(&TestMakeDflt<T>),                             \
-          flags::FlagDefaultKind::kGenFunc                                 \
-    }                                                                      \
+#define DEFINE_CONSTRUCTED_FLAG(T, dflt, dflt_kind)                          \
+  constexpr flags::FlagDefaultArg f1default##T{                              \
+      flags::FlagDefaultSrc{dflt}, flags::FlagDefaultKind::dflt_kind};       \
+  constexpr absl::Flag<T> f1##T{"f1", help_arg, f1default##T};               \
+  ABSL_CONST_INIT absl::Flag<T> f2##T {                                      \
+    "f2", {flags::FlagHelpMsg(&TestHelpMsg), flags::FlagHelpKind::kGenFunc}, \
+        flags::FlagDefaultArg {                                              \
+      flags::FlagDefaultSrc(&TestMakeDflt<T>),                               \
+          flags::FlagDefaultKind::kGenFunc                                   \
+    }                                                                        \
   }
 
 DEFINE_CONSTRUCTED_FLAG(bool, true, kOneWord);
@@ -179,9 +189,9 @@ template <typename T>
 bool TestConstructionFor(const absl::Flag<T>& f1, absl::Flag<T>& f2) {
   EXPECT_EQ(absl::GetFlagReflectionHandle(f1).Name(), "f1");
   EXPECT_EQ(absl::GetFlagReflectionHandle(f1).Help(), "literal help");
-  EXPECT_EQ(absl::GetFlagReflectionHandle(f1).Filename(), "file");
+  EXPECT_EQ(absl::GetFlagReflectionHandle(f1).Filename(), "");
 
-  flags::FlagRegistrar<T, false>(ABSL_FLAG_IMPL_FLAG_PTR(f2), nullptr)
+  flags::FlagRegistrar<T, false>(ABSL_FLAG_IMPL_FLAG_PTR(f2), "file")
       .OnUpdate(TestCallback);
 
   EXPECT_EQ(absl::GetFlagReflectionHandle(f2).Name(), "f2");
@@ -1395,5 +1405,48 @@ TEST_F(FlagTest, TestStdOptional) {
 // --------------------------------------------------------------------
 
 #endif
+
+}  // namespace
+
+ABSL_FLAG(int, concurrent_saver_test_flag, 0,
+          "test flag for concurrent FlagSaver");
+
+namespace {
+
+TEST_F(FlagTest, ConcurrentFlagSaverAndSetFlag) {
+  std::atomic<bool> stop{false};
+  std::thread writer([&stop]() {
+    int i = 1;
+    while (!stop.load(std::memory_order_relaxed)) {
+      absl::SetFlag(&FLAGS_concurrent_saver_test_flag, i++);
+    }
+  });
+  for (int iter = 0; iter < 50; ++iter) {
+    absl::FlagSaver saver;
+    (void)absl::GetFlag(FLAGS_concurrent_saver_test_flag);
+  }
+  stop.store(true, std::memory_order_relaxed);
+  writer.join();
+  EXPECT_GE(absl::GetFlag(FLAGS_concurrent_saver_test_flag), 0);
+}
+
+TEST_F(FlagTest, FilenameInterning) {
+  constexpr const char* kFileA = "dir/intern_test_a.cc";
+  constexpr const char* kFileB = "dir/intern_test_b.cc";
+
+  absl::Flag<int32_t> f_a1{"fa1", help_arg, f1defaultint32_t};
+  absl::Flag<int32_t> f_a2{"fa2", help_arg, f1defaultint32_t};
+  absl::Flag<int32_t> f_b{"fb", help_arg, f1defaultint32_t};
+
+  flags::FlagRegistrar<int32_t, false>(ABSL_FLAG_IMPL_FLAG_PTR(f_a1), kFileA);
+  flags::FlagRegistrar<int32_t, false>(ABSL_FLAG_IMPL_FLAG_PTR(f_a2), kFileA);
+  flags::FlagRegistrar<int32_t, false>(ABSL_FLAG_IMPL_FLAG_PTR(f_b), kFileB);
+  // Duplicate registration preserves the first filename for ODR diagnostics.
+  flags::FlagRegistrar<int32_t, false>(ABSL_FLAG_IMPL_FLAG_PTR(f_a1), kFileB);
+
+  EXPECT_EQ(f_a1.Filename(), "dir/intern_test_a.cc");
+  EXPECT_EQ(f_a2.Filename(), "dir/intern_test_a.cc");
+  EXPECT_EQ(f_b.Filename(), "dir/intern_test_b.cc");
+}
 
 }  // namespace
