@@ -137,6 +137,17 @@ TEST_F(FlagTest, Traits) {
             flags::FlagValueStorageKind::kSequenceLocked);
   EXPECT_EQ(flags::StorageKind<absl::uint128>(),
             flags::FlagValueStorageKind::kSequenceLocked);
+
+  // These sizes are not hard limits, but we want to keep per-flag size as
+  // small as possible because production binaries may define thousands of
+  // flags.
+  if (sizeof(void*) == 8) {
+    EXPECT_EQ(sizeof(flags::FlagImpl), 64);
+    EXPECT_EQ(sizeof(absl::Flag<bool>), 72);
+    EXPECT_EQ(sizeof(absl::Flag<int>), 72);
+    EXPECT_EQ(sizeof(absl::Flag<int64_t>), 72);
+    EXPECT_EQ(sizeof(absl::Flag<double>), 72);
+  }
 }
 
 // --------------------------------------------------------------------
@@ -151,9 +162,9 @@ using uint128 = absl::uint128;
 #define DEFINE_CONSTRUCTED_FLAG(T, dflt, dflt_kind)                        \
   constexpr flags::FlagDefaultArg f1default##T{                            \
       flags::FlagDefaultSrc{dflt}, flags::FlagDefaultKind::dflt_kind};     \
-  constexpr absl::Flag<T> f1##T{"f1", #T, "file", help_arg, f1default##T}; \
+  constexpr absl::Flag<T> f1##T{"f1", "file", help_arg, f1default##T};     \
   ABSL_CONST_INIT absl::Flag<T> f2##T {                                    \
-    "f2", #T, "file",                                                      \
+    "f2", "file",                                                          \
         {flags::FlagHelpMsg(&TestHelpMsg), flags::FlagHelpKind::kGenFunc}, \
         flags::FlagDefaultArg {                                            \
       flags::FlagDefaultSrc(&TestMakeDflt<T>),                             \
@@ -1395,5 +1406,29 @@ TEST_F(FlagTest, TestStdOptional) {
 // --------------------------------------------------------------------
 
 #endif
+
+}  // namespace
+
+ABSL_FLAG(int, concurrent_saver_test_flag, 0,
+          "test flag for concurrent FlagSaver");
+
+namespace {
+
+TEST_F(FlagTest, ConcurrentFlagSaverAndSetFlag) {
+  std::atomic<bool> stop{false};
+  std::thread writer([&stop]() {
+    int i = 1;
+    while (!stop.load(std::memory_order_relaxed)) {
+      absl::SetFlag(&FLAGS_concurrent_saver_test_flag, i++);
+    }
+  });
+  for (int iter = 0; iter < 50; ++iter) {
+    absl::FlagSaver saver;
+    (void)absl::GetFlag(FLAGS_concurrent_saver_test_flag);
+  }
+  stop.store(true, std::memory_order_relaxed);
+  writer.join();
+  EXPECT_GE(absl::GetFlag(FLAGS_concurrent_saver_test_flag), 0);
+}
 
 }  // namespace
