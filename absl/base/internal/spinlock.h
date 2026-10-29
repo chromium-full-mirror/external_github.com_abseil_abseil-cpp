@@ -329,6 +329,32 @@ inline uint32_t SpinLock::TryLockInternal(uint32_t lock_value,
   return lock_value;
 }
 
+// Spin limits.
+
+// Bounds on calibrated spin iterations on multi-CPU machines.
+inline constexpr int kMinSpinIterations = 1000;
+inline constexpr int kMaxSpinIterations = 12000;
+
+// Steps per calibration probe trial and number of trials taken per probe.
+inline constexpr int kProbeSteps = 4096;
+inline constexpr int kProbeReadings = 4;
+
+// Computes a spin-loop iteration count from `num_cpus` (> 1), CycleClock `freq`
+// (> 0, in Hz), and positive `kProbeSteps`-step cycle counts for the latency
+// and spin-loop probes. Exposed in base_internal for unit testing; callers
+// should use CalibrateSpinIterations().
+int ComputeSpinIterations(int num_cpus, double freq,
+                          int64_t latency_probe_cycles,
+                          int64_t spin_probe_cycles);
+
+// Calibrates a spin-loop iteration count in
+// [kMinSpinIterations, kMaxSpinIterations] from this host's CPU capacity and
+// single-core speed, timing `spin_probe_fn(steps)` to convert the target spin
+// duration into iterations. Returns 1 on single-CPU hosts, or
+// `fallback_iterations` if CycleClock calibration is unavailable.
+int CalibrateSpinIterations(void (*absl_nonnull spin_probe_fn)(int steps),
+                            int fallback_iterations);
+
 }  // namespace base_internal
 ABSL_NAMESPACE_END
 }  // namespace absl

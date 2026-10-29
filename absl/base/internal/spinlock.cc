@@ -14,7 +14,9 @@
 
 #include "absl/base/internal/spinlock.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 
 #include "absl/base/attributes.h"
@@ -110,6 +112,123 @@ static void ReportLockWait(SpinLock& lock, int64_t wait_start_time,
   ABSL_TSAN_MUTEX_POST_DIVERT(&lock, 0);
 }
 
+namespace {
+
+// Spin duration target:
+//
+//   T = min(kSpinLimitMaxNs,
+//           kSpinLimitNs * kSpinLimitReferenceCapacity / (g * N))
+//
+// where N is NumCPUs() and g is the estimated speed of one logical CPU in
+// compute units (~1.0 for a baseline server core), so g * N is the machine's
+// compute capacity. T is a duration rather than an iteration count because
+// spin-loop iteration time varies by 2-4x across CPUs, and scales inversely
+// with capacity because job schedulers pack work in proportion to capacity.
+constexpr double kSpinLimitNs = 1400;
+constexpr double kSpinLimitReferenceCapacity = 250;
+constexpr double kSpinLimitMaxNs = 5000;
+
+// Empirical power-law fit `g = 1.65 * (4000ns / probe_ns)^1.2` mapping the
+// `kProbeSteps` latency probe duration (`kProbeReadings` trials) to
+// per-logical-CPU compute units.
+constexpr uint64_t kProbeMixMultiplier = 0xbf58476d1ce4e5b9ULL;  // SplitMix64.
+constexpr double kProbeReferenceNs = 4000;
+constexpr double kProbeReferenceCompute = 1.65;
+constexpr double kProbeExponent = 1.2;
+
+// Minimum usable CycleClock rate (2 MHz, <= 500ns/tick), fine enough for a
+// `kProbeSteps` probe to advance CycleClock::Now() and also rejecting
+// uncalibrated fallbacks (e.g. NominalCPUFrequency() == 1.0).
+constexpr double kMinCycleClockFrequency = 2e6;
+
+// Measures single-core integer execution latency via a `steps`-step serial
+// dependency chain (xorshift + 64-bit multiply). Seeded and consumed through
+// `volatile` so the compiler cannot constant-fold, eliminate, or reorder the
+// loop across CycleClock::Now() reads.
+void RunLatencyProbe(int steps) {
+  volatile uint64_t sink = 1;
+  uint64_t state = sink;
+  for (int i = 0; i < steps; ++i) {
+    state = (state ^ (state >> 29)) * kProbeMixMultiplier;
+  }
+  sink = state;
+}
+
+int64_t MeasureMinProbeCycles(void (*probe_fn)(int steps)) {
+  int64_t min_cycles = 0;
+  for (int reading = 0; reading < kProbeReadings; ++reading) {
+    const int64_t start = CycleClock::Now();
+    probe_fn(kProbeSteps);
+    const int64_t elapsed = CycleClock::Now() - start;
+    if (elapsed > 0 && (min_cycles == 0 || elapsed < min_cycles)) {
+      min_cycles = elapsed;
+    }
+  }
+  return min_cycles;
+}
+
+}  // namespace
+
+int ComputeSpinIterations(int num_cpus, double freq,
+                          int64_t latency_probe_cycles,
+                          int64_t spin_probe_cycles) {
+  const double latency_probe_ns = latency_probe_cycles * 1e9 / freq;
+  const double compute_per_cpu =
+      kProbeReferenceCompute *
+      std::pow(kProbeReferenceNs / latency_probe_ns, kProbeExponent);
+  const double limit_ns = std::min(
+      kSpinLimitMaxNs, kSpinLimitNs * kSpinLimitReferenceCapacity /
+                           (compute_per_cpu * num_cpus));
+  const double spin_iter_ns = spin_probe_cycles * 1e9 / (freq * kProbeSteps);
+  const double iterations = limit_ns / spin_iter_ns;
+  return static_cast<int>(
+      std::clamp<double>(iterations, kMinSpinIterations, kMaxSpinIterations));
+}
+
+int CalibrateSpinIterations(void (*absl_nonnull spin_probe_fn)(int steps),
+                            int fallback_iterations) {
+  const int num_cpus = NumCPUs();
+  if (num_cpus <= 1) {
+    // Uniprocessors don't spin: callers use `do/while (--iterations > 0)`
+    // loops, so 1 performs a single attempt and is non-zero (initialized).
+    return 1;
+  }
+  const double freq = CycleClock::Frequency();
+  if (freq < kMinCycleClockFrequency) {
+    return fallback_iterations;
+  }
+
+  const int64_t latency_probe_cycles = MeasureMinProbeCycles(&RunLatencyProbe);
+  const int64_t spin_probe_cycles = MeasureMinProbeCycles(spin_probe_fn);
+  if (latency_probe_cycles <= 0 || spin_probe_cycles <= 0) {
+    // If CycleClock fails to advance across all probe readings, permanently
+    // fall back to the caller's default spin count.
+    return fallback_iterations;
+  }
+  return ComputeSpinIterations(num_cpus, freq, latency_probe_cycles,
+                               spin_probe_cycles);
+}
+
+// Spins up to `iterations` times waiting for bit 0 (`kSpinLockHeld`) of
+// `*lockword` to clear, returning the last value read. Marked noinline so
+// ProbeSpinLockLoop() and SpinLock::SpinLoop() execute the same compiled loop
+// and SpinLock::SpinLoop() can tail-call it without a stack frame.
+ABSL_ATTRIBUTE_NOINLINE static uint32_t SpinLockLoop(
+    const std::atomic<uint32_t>* lockword, int iterations) {
+  constexpr uint32_t kSpinLockHeldBit = 1;
+  uint32_t lock_value;
+  do {
+    lock_value = lockword->load(std::memory_order_relaxed);
+  } while ((lock_value & kSpinLockHeldBit) != 0 && --iterations > 0);
+  return lock_value;
+}
+
+static void ProbeSpinLockLoop(int steps) {
+  std::atomic<uint32_t> held_lockword{1};
+  const std::atomic<uint32_t>* volatile ptr = &held_lockword;
+  [[maybe_unused]] volatile uint32_t sink = SpinLockLoop(ptr, steps);
+}
+
 // Monitor the lock to see if its value changes within some time period
 // (adaptive_spin_count_ loop iterations). The last value read from the lock
 // is returned from the method.
@@ -119,7 +238,8 @@ uint32_t SpinLock::SpinLoop() {
   // adaptive_spin_count here.
   if (adaptive_spin_count_.load(std::memory_order_relaxed) == 0) {
     int current_spin_count = 0;
-    int new_spin_count = NumCPUs() > 1 ? 1000 : 1;
+    int new_spin_count =
+        CalibrateSpinIterations(&ProbeSpinLockLoop, kMinSpinIterations);
     // If this fails, the value will remain unchanged. We may not spin for the
     // intended duration, but that is still safe. We will try again on the next
     // call to SpinLoop.
@@ -128,11 +248,7 @@ uint32_t SpinLock::SpinLoop() {
         std::memory_order_relaxed);
   }
   int c = adaptive_spin_count_.load(std::memory_order_relaxed);
-  uint32_t lock_value;
-  do {
-    lock_value = lockword_.load(std::memory_order_relaxed);
-  } while ((lock_value & kSpinLockHeld) != 0 && --c > 0);
-  return lock_value;
+  return SpinLockLoop(&lockword_, c);
 }
 
 void SpinLock::SlowLock() {

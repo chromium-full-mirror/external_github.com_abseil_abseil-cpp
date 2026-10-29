@@ -1571,10 +1571,9 @@ void Mutex::AssertNotHeld() const {
   }
 }
 
-// Attempt to acquire *mu, and return whether successful.  The implementation
-// may spin for a short while if the lock cannot be acquired immediately.
-static bool TryAcquireWithSpinning(std::atomic<intptr_t>* mu) {
-  int c = globals.spinloop_iterations.load(std::memory_order_relaxed);
+// Attempt to acquire *mu within `iterations` iterations, and return whether
+// successful.
+static bool TryAcquireWithSpinning(std::atomic<intptr_t>* mu, int iterations) {
   do {  // do/while somewhat faster on AMD
     intptr_t v = mu->load(std::memory_order_relaxed);
     if ((v & (kMuReader | kMuEvent)) != 0) {
@@ -1585,8 +1584,14 @@ static bool TryAcquireWithSpinning(std::atomic<intptr_t>* mu) {
                                            std::memory_order_relaxed)) {
       return true;
     }
-  } while (--c > 0);
+  } while (--iterations > 0);
   return false;
+}
+
+static void ProbeMutexSpinLoop(int steps) {
+  std::atomic<intptr_t> held_mu{kMuWriter};
+  std::atomic<intptr_t>* volatile ptr = &held_mu;
+  [[maybe_unused]] volatile bool sink = TryAcquireWithSpinning(ptr, steps);
 }
 
 void Mutex::lock() {
@@ -1599,7 +1604,10 @@ void Mutex::lock() {
           v, kMuWriter | v, std::memory_order_acquire,
           std::memory_order_relaxed))) {
     // try spin acquire, then slow loop
-    if (ABSL_PREDICT_FALSE(!TryAcquireWithSpinning(&this->mu_))) {
+    int spin_iterations =
+        globals.spinloop_iterations.load(std::memory_order_relaxed);
+    if (ABSL_PREDICT_FALSE(
+            !TryAcquireWithSpinning(&this->mu_, spin_iterations))) {
       this->LockSlow(kExclusive, nullptr, 0);
     }
   }
@@ -1898,13 +1906,9 @@ ABSL_ATTRIBUTE_NOINLINE void Mutex::LockSlow(MuHow how, const Condition* cond,
   // spinloop_iterations properly initialized.
   if (ABSL_PREDICT_FALSE(
           globals.spinloop_iterations.load(std::memory_order_relaxed) == 0)) {
-    if (absl::base_internal::NumCPUs() > 1) {
-      // If this is multiprocessor, allow spinning.
-      globals.spinloop_iterations.store(1500, std::memory_order_relaxed);
-    } else {
-      // If this a uniprocessor, only yield/sleep.
-      globals.spinloop_iterations.store(-1, std::memory_order_relaxed);
-    }
+    globals.spinloop_iterations.store(
+        base_internal::CalibrateSpinIterations(&ProbeMutexSpinLoop, 1500),
+        std::memory_order_relaxed);
   }
   ABSL_RAW_CHECK(
       this->LockSlowWithDeadline(how, cond, KernelTimeout::Never(), flags),

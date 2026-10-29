@@ -296,6 +296,68 @@ TEST(SpinLockTest, ScopedLock) {
   std::scoped_lock l(s);
 }
 
+TEST(SpinLockTest, ComputeSpinIterationsScalesWithCapacityAndLoopSpeed) {
+  constexpr int kNumCpus = 80;
+  constexpr double kOneGHz = 1e9;
+  constexpr int64_t kRefLatencyCycles = 4000;
+  constexpr int64_t kSlowCoreLatencyCycles = 6000;
+  constexpr int64_t kFastCoreLatencyCycles = 3000;
+  constexpr int64_t kOneNsPerSpinIter = kProbeSteps;
+
+  // In the unclamped regime, doubling NumCPUs() halves the target spin budget.
+  const int base_iters = ComputeSpinIterations(
+      kNumCpus, kOneGHz, kRefLatencyCycles, kOneNsPerSpinIter);
+  const int double_cpu_iters = ComputeSpinIterations(
+      2 * kNumCpus, kOneGHz, kRefLatencyCycles, kOneNsPerSpinIter);
+  EXPECT_GT(double_cpu_iters, kMinSpinIterations);
+  EXPECT_LT(base_iters, kMaxSpinIterations);
+  EXPECT_NEAR(base_iters, 2 * double_cpu_iters, 1);
+
+  // Faster cores (fewer latency-probe cycles -> higher g) get a smaller spin
+  // time budget at the same CPU count and spin-loop speed.
+  const int slow_core = ComputeSpinIterations(
+      kNumCpus, kOneGHz, kSlowCoreLatencyCycles, kOneNsPerSpinIter);
+  const int fast_core = ComputeSpinIterations(
+      kNumCpus, kOneGHz, kFastCoreLatencyCycles, kOneNsPerSpinIter);
+  EXPECT_LT(slow_core, kMaxSpinIterations);
+  EXPECT_GT(slow_core, base_iters);
+  EXPECT_GT(base_iters, fast_core);
+  EXPECT_GT(fast_core, kMinSpinIterations);
+
+  // Faster spin loops (fewer cycles per probe) run proportionally more
+  // iterations for the same target spin duration.
+  const int half_ns_per_iter = ComputeSpinIterations(
+      kNumCpus, kOneGHz, kRefLatencyCycles, kOneNsPerSpinIter / 2);
+  const int quarter_ns_per_iter = ComputeSpinIterations(
+      kNumCpus, kOneGHz, kRefLatencyCycles, kOneNsPerSpinIter / 4);
+  EXPECT_LT(quarter_ns_per_iter, kMaxSpinIterations);
+  EXPECT_NEAR(half_ns_per_iter, 2 * base_iters, 1);
+  EXPECT_NEAR(quarter_ns_per_iter, 2 * half_ns_per_iter, 1);
+}
+
+TEST(SpinLockTest, CalibrateSpinIterationsCallsProbeAndRespectsLimits) {
+  if (NumCPUs() <= 1) return;
+  static int probe_calls;
+  static int probe_steps;
+  probe_calls = 0;
+  probe_steps = 0;
+
+  const int iterations = CalibrateSpinIterations(
+      [](int steps) {
+        ++probe_calls;
+        probe_steps = steps;
+        [[maybe_unused]] volatile int sink = 0;
+        for (int i = 0; i < steps; ++i) {
+          sink = i;
+        }
+      },
+      /*fallback_iterations=*/0);
+  EXPECT_EQ(probe_calls, kProbeReadings);
+  EXPECT_EQ(probe_steps, kProbeSteps);
+  EXPECT_GE(iterations, kMinSpinIterations);
+  EXPECT_LE(iterations, kMaxSpinIterations);
+}
+
 }  // namespace
 }  // namespace base_internal
 ABSL_NAMESPACE_END
