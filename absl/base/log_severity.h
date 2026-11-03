@@ -16,7 +16,7 @@
 #define ABSL_BASE_LOG_SEVERITY_H_
 
 #include <array>
-#include <ostream>
+#include <iosfwd>
 
 #include "absl/base/attributes.h"
 #include "absl/base/config.h"
