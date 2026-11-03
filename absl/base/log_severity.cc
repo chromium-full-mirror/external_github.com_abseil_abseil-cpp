@@ -14,9 +14,11 @@
 
 #include "absl/base/log_severity.h"
 
+#if (!defined(__STDC_HOSTED__) || __STDC_HOSTED__ == 1) && \
+    (!defined(_LIBCPP_HAS_LOCALIZATION) || _LIBCPP_HAS_LOCALIZATION != 0)
+
 #include <ostream>
 
-#include "absl/base/attributes.h"
 #include "absl/base/config.h"
 
 namespace absl {
@@ -52,5 +54,8 @@ std::ostream& operator<<(std::ostream& os, absl::LogSeverityAtMost s) {
   }
   return os;
 }
+
 ABSL_NAMESPACE_END
 }  // namespace absl
+
+#endif
