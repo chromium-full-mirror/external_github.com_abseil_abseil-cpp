@@ -134,7 +134,7 @@ HashtablezInfoHandle ForcedTrySample(const HashtableTypeInfo& info) {
 void TestOnlyRefreshSamplingStateForCurrentThread() {
   global_next_sample.next_sample =
       g_hashtablez_sample_parameter.load(std::memory_order_relaxed);
-  global_next_sample.sample_stride = global_next_sample.next_sample;
+  global_next_sample.sample_period = global_next_sample.next_sample;
 }
 #else
 HashtablezInfoHandle ForcedTrySample(const HashtableTypeInfo&) {
@@ -147,45 +147,29 @@ HashtablezInfo* SampleSlow(SamplingState& next_sample,
                            size_t inline_element_size, size_t key_size,
                            size_t value_size, uint16_t soo_capacity) {
   if (ABSL_PREDICT_FALSE(ShouldForceSampling())) {
-    next_sample.next_sample = 1;
-    const int64_t old_stride = std::exchange(next_sample.sample_stride, 1);
-    HashtablezInfo* result = GlobalHashtablezSampler().Register(
-        old_stride, inline_element_size, key_size, value_size, soo_capacity);
-    return result;
+    next_sample = {1, 1};
+    return GlobalHashtablezSampler().Register(
+        1, inline_element_size, key_size, value_size, soo_capacity);
   }
 
 #if !defined(ABSL_INTERNAL_HASHTABLEZ_SAMPLE)
   next_sample = {
-      std::numeric_limits<int64_t>::max(),
-      std::numeric_limits<int64_t>::max(),
+      (std::numeric_limits<int64_t>::max)(),
+      0,
   };
   return nullptr;
 #else
-  bool first = next_sample.next_sample < 0;
-
-  const int64_t next_stride = g_exponential_biased_generator.GetStride(
-      g_hashtablez_sample_parameter.load(std::memory_order_relaxed));
-
-  next_sample.next_sample = next_stride;
-  const int64_t old_stride =
-      std::exchange(next_sample.sample_stride, next_stride);
-  // Small values of interval are equivalent to just sampling next time.
-  ABSL_ASSERT(next_stride >= 1);
-
+  const int32_t rate =
+      g_hashtablez_sample_parameter.load(std::memory_order_relaxed);
+  const bool enabled = g_hashtablez_enabled.load(std::memory_order_relaxed);
   // g_hashtablez_enabled can be dynamically flipped, we need to set a threshold
   // low enough that we will start sampling in a reasonable time, so we just use
-  // the default sampling rate.
-  if (!g_hashtablez_enabled.load(std::memory_order_relaxed)) return nullptr;
-
-  // We will only be negative on our first count, so we should just retry in
-  // that case.
-  if (first) {
-    if (ABSL_PREDICT_TRUE(--next_sample.next_sample > 0)) return nullptr;
-    return SampleSlow(next_sample, inline_element_size, key_size, value_size,
-                      soo_capacity);
-  }
-
-  return GlobalHashtablezSampler().Register(old_stride, inline_element_size,
+  // the configured sampling rate.
+  const int64_t weight = g_exponential_biased_generator.ConfirmSampleSlow(
+      next_sample, enabled ? rate : 0, /*step=*/1,
+      /*disabled_stride=*/rate > 0 ? rate : (1 << 10));
+  if (weight <= 0) return nullptr;
+  return GlobalHashtablezSampler().Register(weight, inline_element_size,
                                             key_size, value_size, soo_capacity);
 #endif
 }

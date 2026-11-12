@@ -20,6 +20,7 @@
 #include "absl/base/attributes.h"
 #include "absl/base/config.h"
 #include "absl/base/optimization.h"
+#include "absl/profiling/internal/exponential_biased.h"
 
 namespace absl {
 ABSL_NAMESPACE_BEGIN
@@ -41,10 +42,7 @@ void set_cordz_mean_interval(int32_t mean_interval);
 
 #ifdef ABSL_INTERNAL_CORDZ_ENABLED
 
-struct SamplingState {
-  int64_t next_sample;
-  int64_t sample_stride;
-};
+using SamplingState = ::absl::profiling_internal::SamplingState;
 
 // cordz_next_sample is the number of events until the next sample event. If
 // the value is 1 or less, the code will check on the next event if cordz is
@@ -55,16 +53,16 @@ ABSL_CONST_INIT extern thread_local SamplingState cordz_next_sample;
 // Determines if the next sample should be profiled.
 // Returns:
 //   0: Do not sample
-//  >0: Sample with the stride of the last sampling period
+//  >0: Sample with the sampling period active for the completed stride
 int64_t cordz_should_profile_slow(SamplingState& state);
 
 // Determines if the next sample should be profiled.
 // Returns:
 //   0: Do not sample
-//  >0: Sample with the stride of the last sampling period
+//  >0: Sample with the sampling period active for the completed stride
 inline int64_t cordz_should_profile() {
-  if (ABSL_PREDICT_TRUE(cordz_next_sample.next_sample > 1)) {
-    cordz_next_sample.next_sample--;
+  if (ABSL_PREDICT_TRUE(
+          !absl::profiling_internal::ShouldSampleNext(cordz_next_sample))) {
     return 0;
   }
   return cordz_should_profile_slow(cordz_next_sample);

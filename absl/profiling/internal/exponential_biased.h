@@ -19,19 +19,54 @@
 
 #include "absl/base/config.h"
 #include "absl/base/macros.h"
+#include "absl/base/optimization.h"
 
 namespace absl {
 ABSL_NAMESPACE_BEGIN
 namespace profiling_internal {
 
+// Per-thread state for stride-based periodic sampling with unbiased unsampling
+// weights.
+//
+// `SamplingState` is a trivial, zero-initializable POD so callers can place it
+// in `ABSL_PER_THREAD_TLS_KEYWORD` (`__thread`) or `ABSL_CONST_INIT
+// thread_local` variables inside hot headers without dynamic TLS initialization
+// guards.
+//
+// Why `sample_period` stores the configured period rather than the random
+// `GetStride()` draw:
+//   1. Because the geometric/exponential countdown is memoryless, every item
+//      has the same `1 / period` inclusion probability regardless of the random
+//      gap that preceded it. Weighting a sampled item by the realized random
+//      draw doubles per-callsite estimator variance and produces ~18x
+//      single-sample weight outliers.
+//   2. On a newly started thread, any random stride finishing at the t-th item
+//      satisfies `stride <= t` (for example, if item #1 is sampled, its stride
+//      was necessarily 1), systematically undercounting items created early in
+//      a thread's lifetime (`1 - (1 - 1/period)^t` in expectation instead of
+//      1).
+//   3. Snapshotting `sample_period` when `next_sample` is drawn preserves
+//      unbiased weights across runtime changes to the configured period.
+struct SamplingState {
+  // Remaining distance (events or bytes) until the next sample. Zero on a
+  // newly initialized thread so the first fast-path decrement enters
+  // `ConfirmSampleSlow()` to draw an initial stride.
+  int64_t next_sample = 0;
+
+  // Sampling period active when `next_sample` was drawn, or 0 when
+  // uninitialized or after a disabled check.
+  int64_t sample_period = 0;
+};
+
 // ExponentialBiased provides a small and fast random number generator for a
-// rounded exponential distribution. This generator manages very little state,
-// and imposes no synchronization overhead. This makes it useful in specialized
-// scenarios requiring minimum overhead, such as stride based periodic sampling.
+// memoryless geometric distribution (the discrete analog of an exponential
+// distribution). This generator manages very little state, and imposes no
+// synchronization overhead. This makes it useful in specialized scenarios
+// requiring minimum overhead, such as stride-based periodic sampling.
 //
 // ExponentialBiased provides two closely related functions, GetSkipCount() and
-// GetStride(), both returning a rounded integer defining a number of events
-// required before some event with a given mean probability occurs.
+// GetStride(), returning the number of events to skip (`>= 0`) or the number
+// of events required (`>= 1`) before an event with a given mean occurs.
 //
 // The distribution is useful to generate a random wait time or some periodic
 // event with a given mean probability. For example, if an action is supposed to
@@ -44,31 +79,12 @@ namespace profiling_internal {
 //   }
 //
 //   void Frobber::Frob(int arg) {
-//     if (--stride == 0) {
+//     if (--stride_ == 0) {
 //       SampleFrob(arg);
 //       stride_ = exponential_biased_.GetStride(1000);
 //     }
 //     ...
 //   }
-//
-// The rounding of the return value creates a bias, especially for smaller means
-// where the distribution of the fraction is not evenly distributed. We correct
-// this bias by tracking the fraction we rounded up or down on each iteration,
-// effectively tracking the distance between the cumulative value, and the
-// rounded cumulative value. For example, given a mean of 2:
-//
-//   raw = 1.63076, cumulative = 1.63076, rounded = 2, bias = -0.36923
-//   raw = 0.14624, cumulative = 1.77701, rounded = 2, bias =  0.14624
-//   raw = 4.93194, cumulative = 6.70895, rounded = 7, bias = -0.06805
-//   raw = 0.24206, cumulative = 6.95101, rounded = 7, bias =  0.24206
-//   etc...
-//
-// Adjusting with rounding bias is relatively trivial:
-//
-//    double value = bias_ + exponential_distribution(mean)();
-//    double rounded_value = std::rint(value);
-//    bias_ = value - rounded_value;
-//    return rounded_value;
 //
 // This class is thread-compatible.
 class ExponentialBiased {
@@ -98,6 +114,26 @@ class ExponentialBiased {
   // `GetSkipCount()` depends mostly on what best fits the use case.
   int64_t GetStride(int64_t mean);
 
+  // Slow-path companion to `ShouldSampleNext()`. Must be called whenever
+  // `ShouldSampleNext(state, step)` returns true (or directly in tests with
+  // `state.next_sample <= 0`).
+  //
+  // Returns 0 if the current event should NOT be sampled, or a positive
+  // unsampling weight if it SHOULD be sampled:
+  //   * Unit-step item sampling (`step == 1`, e.g. hashtablez, cordz): returns
+  //     `sample_period` (the period active when the completed stride started),
+  //     including when the very first item on a thread is sampled.
+  //   * Weighted/byte sampling (`step == size + 1`, e.g. heap profilers):
+  //     returns `sample_period - state.next_sample` (`sample_period` plus any
+  //     within-item overshoot past zero), matching `size / (1 - exp(-size /
+  //     sample_period))` in expectation without computing `exp()`.
+  //
+  // If `period <= 0`, sampling is treated as disabled: `state` is set to skip
+  // `disabled_stride` units before re-checking `period`, and 0 is returned.
+  int64_t ConfirmSampleSlow(SamplingState& state, int64_t period,
+                            int64_t step = 1,
+                            int64_t disabled_stride = 1 << 16);
+
   // Computes a random number in the range [0, 1<<(kPrngNumBits+1) - 1]
   //
   // This is public to enable testing.
@@ -107,7 +143,6 @@ class ExponentialBiased {
   void Initialize();
 
   uint64_t rng_{0};
-  double bias_{0};
   bool initialized_{false};
 };
 
@@ -121,6 +156,29 @@ inline uint64_t ExponentialBiased::NextRandom(uint64_t rnd) {
   const uint64_t prng_mod_mask =
       ~((~static_cast<uint64_t>(0)) << prng_mod_power);
   return (prng_mult * rnd + prng_add) & prng_mod_mask;
+}
+
+// Fast-path decrement for always-on samplers (`hashtablez`, `cordz`, heap
+// samplers). Touches only `state` in TLS without loading the global period on
+// the fast path. When this returns true, the caller must invoke
+// `ExponentialBiased::ConfirmSampleSlow()`.
+inline bool ShouldSampleNext(SamplingState& state, int64_t step = 1) {
+  state.next_sample -= step;
+  return ABSL_PREDICT_FALSE(state.next_sample <= 0);
+}
+
+// Combined fast/slow helper for windowed on-demand samplers whose global
+// `period` is 0 when idle and may change dynamically between collection
+// windows. Resets any pending stride immediately when `period` changes, and
+// returns 0 (skip) or the positive unsampling weight (`period`).
+inline int64_t SampleWithLivePeriod(SamplingState& state, int64_t period,
+                                    ExponentialBiased& rng) {
+  if (ABSL_PREDICT_TRUE(period <= 0)) return 0;
+  if (ABSL_PREDICT_FALSE(state.sample_period != period)) {
+    state = {0, 0};
+  }
+  if (ABSL_PREDICT_TRUE(!ShouldSampleNext(state))) return 0;
+  return rng.ConfirmSampleSlow(state, period);
 }
 
 }  // namespace profiling_internal

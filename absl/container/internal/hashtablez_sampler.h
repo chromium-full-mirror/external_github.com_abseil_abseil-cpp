@@ -53,6 +53,7 @@
 #include "absl/base/optimization.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/container/internal/container_memory.h"
+#include "absl/profiling/internal/exponential_biased.h"
 #include "absl/profiling/internal/sample_recorder.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
@@ -123,12 +124,7 @@ void RecordInsertMissSlow(HashtablezInfo* info, size_t hash,
 
 void RecordEraseSlow(HashtablezInfo* info);
 
-struct SamplingState {
-  int64_t next_sample;
-  // When we make a sampling decision, we record that distance so we can weight
-  // each sample.
-  int64_t sample_stride;
-};
+using SamplingState = ::absl::profiling_internal::SamplingState;
 
 HashtablezInfo* SampleSlow(SamplingState& next_sample,
                            size_t inline_element_size, size_t key_size,
@@ -226,10 +222,7 @@ extern ABSL_PER_THREAD_TLS_KEYWORD SamplingState global_next_sample;
 // ForcedTrySample().
 inline bool ShouldSampleNextTable() {
 #if defined(ABSL_INTERNAL_HASHTABLEZ_SAMPLE)
-  if (ABSL_PREDICT_TRUE(--global_next_sample.next_sample > 0)) {
-    return false;
-  }
-  return true;
+  return absl::profiling_internal::ShouldSampleNext(global_next_sample);
 #else
   return false;
 #endif  // ABSL_INTERNAL_HASHTABLEZ_SAMPLE

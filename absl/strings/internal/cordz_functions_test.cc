@@ -128,6 +128,40 @@ TEST(CordzFunctionsTest, ShouldProfileRate) {
   set_cordz_mean_interval(orig_sample_rate);
 }
 
+TEST(CordzFunctionsTest, SampleWeightEqualsMeanInterval) {
+  const int32_t orig_sample_rate = get_cordz_mean_interval();
+  constexpr int32_t kInterval = 16;
+  constexpr int kTrials = 100000;
+  set_cordz_mean_interval(kInterval);
+
+  // Both the first Cord on a fresh thread and steady-state Cords must return
+  // constant weight `kInterval` and sum to `kTrials` in expectation.
+  int64_t first_cord_weight_sum = 0;
+  for (int i = 0; i < kTrials; ++i) {
+    cordz_set_next_sample_for_testing(-1);
+    const int64_t w = cordz_should_profile();
+    if (w > 0) {
+      ASSERT_EQ(w, kInterval);
+      first_cord_weight_sum += w;
+    }
+  }
+  EXPECT_NEAR(static_cast<double>(first_cord_weight_sum), kTrials,
+              0.10 * kTrials);
+
+  cordz_set_next_sample_for_testing(-1);
+  int64_t steady_weight_sum = 0;
+  for (int i = 0; i < kTrials; ++i) {
+    const int64_t w = cordz_should_profile();
+    if (w > 0) {
+      ASSERT_EQ(w, kInterval);
+      steady_weight_sum += w;
+    }
+  }
+  EXPECT_NEAR(static_cast<double>(steady_weight_sum), kTrials, 0.10 * kTrials);
+
+  set_cordz_mean_interval(orig_sample_rate);
+}
+
 #else  // ABSL_INTERNAL_CORDZ_ENABLED
 
 TEST(CordzFunctionsTest, ShouldProfileDisabled) {
