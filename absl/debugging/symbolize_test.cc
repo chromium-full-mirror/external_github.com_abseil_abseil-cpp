@@ -185,6 +185,24 @@ TEST(Symbolize, Cached) {
               strcmp("static_func()", static_func_symbol) == 0);
 
   EXPECT_TRUE(nullptr == TrySymbolize(nullptr));
+#ifdef ABSL_INTERNAL_HAVE_ELF_SYMBOLIZE
+  // An unmapped low address misses once and refreshes the cached address map;
+  // verify subsequent uncached lookup still succeeds cleanly.
+  EXPECT_EQ(nullptr, TrySymbolize(reinterpret_cast<void*>(uintptr_t{0x100})));
+#if defined(__linux__) && defined(__LP64__) &&                                \
+    (defined(__x86_64__) || defined(__aarch64__) || defined(__powerpc64__) || \
+     (defined(__riscv) && defined(__riscv_xlen) && __riscv_xlen == 64))
+  // High-bit-set non-userspace addresses should fail to symbolize quickly
+  // without re-reading /proc/self/maps or clearing the cached address map.
+  EXPECT_EQ(nullptr,
+            TrySymbolize(reinterpret_cast<void*>((uintptr_t{0xFE} << 56) | 1)));
+  EXPECT_EQ(nullptr, TrySymbolize(reinterpret_cast<void*>(~uintptr_t{0})));
+#endif
+  // Distinct (uncached) offset exercises `addr_map_` lookup after the misses.
+  EXPECT_STREQ("nonstatic_func",
+               TrySymbolize(reinterpret_cast<void*>(
+                   reinterpret_cast<uintptr_t>(&nonstatic_func) + 1)));
+#endif
 }
 
 TEST(Symbolize, Truncation) {
@@ -364,8 +382,9 @@ TEST(Symbolize, SymbolizeWithMultipleMaps) {
     ASSERT_NE(ret, MAP_FAILED);
   }
 
-  // Invalidate the symbolization cache so we are forced to rely on the hint.
-  absl::Symbolize(nullptr, buf, sizeof(buf));
+  // Refresh the symbolization cache so we are forced to rely on the hint.
+  // Use a non-null, unmapped user-space address (nullptr is fast-rejected).
+  absl::Symbolize(reinterpret_cast<void*>(1), buf, sizeof(buf));
 
   // Verify we can still symbolize.
   const char *expected[] = {"kPadding0", "kPadding1"};
